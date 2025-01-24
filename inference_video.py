@@ -1,23 +1,11 @@
+import argparse
 import os
 import json
 from datetime import timedelta
 import math
-from collections import deque
 
 import cv2
 from ultralytics import YOLO
-
-MODEL_PATH = "/home/bc/tcx/EPI_detection/runs/detect/train3/weights/best.pt"
-VIDEO_PATH = "/home/bc/tcx/EPI_detection/data/teste.mp4"
-VEHICLE_ROI_FOLDER = "/home/bc/tcx/EPI_detection/ROI/vehicle"
-PEOPLE_ROI_FOLDER = "/home/bc/tcx/EPI_detection/ROI/people"
-LOG_FILE_PATH = "/home/bc/tcx/EPI_detection/alertas.log"
-
-model = YOLO(MODEL_PATH)
-
-detected_objects = 0
-alerts_history = []
-obj_history = []
 
 def calculate_center(box):
     """
@@ -42,18 +30,45 @@ def euclidean_distance(point1, point2):
     """
     return math.sqrt((point1[0] - point2[0]) ** 2 + (point1[1] - point2[1]) ** 2)
 
-def match_and_update_history(current_frame_objects, threshold=100):
+def save_roi(image, label, folder, prefix):
+    x1, y1, x2, y2 = (int(label["box"][key]) for key in ["x1", "y1", "x2", "y2"])
+    
+    roi = image[y1:y2, x1:x2]
+    
+    file_name = f"{prefix}_{label['name']}.jpg"
+    
+    # Ensure folder exists
+    os.makedirs(folder, exist_ok=True)
+    
+    cv2.imwrite(os.path.join(folder, file_name), roi)
+
+def log_alert(log_file_path, timestamp, message):
+    """
+    Write an alert message to the log file.
+    Args:
+        log_file_path: Path to the log file.
+        timestamp: Timestamp of the alert.
+        message: Message to log.
+    """
+    with open(log_file_path, "a") as log_file:
+        log_file.write(f"{timestamp}: {message}\n")
+
+def match_and_update_history(
+        current_frame_objects, 
+        obj_history,
+        max_occlusion_frames,
+        threshold=150
+    ):
     """
     Match detected objects with the history based on Euclidean distance and update the history.
     Args:
         current_frame_objects: List of objects detected in the current frame.
-        label_class: The class of objects to process (e.g., "person").
+        obj_history: List of previous objects.
+        max_occlusion_frames: Maximum number of frames an object can be occluded.
         threshold: Distance threshold to consider objects as the same.
     """
-    # current_frame_objects = []
-    global obj_history
-    global detected_objects
-    
+    global num_detected_objects
+
     for prev_obj in obj_history:
         prev_obj["frames_remaining"] -= 1
     
@@ -64,60 +79,43 @@ def match_and_update_history(current_frame_objects, threshold=100):
         matched = False
         closest_distance = math.inf
 
-        # Check against history
         for prev_obj in obj_history:
             prev_center = prev_obj["center"]
             prev_label = prev_obj["name"]
             
-            
             distance = euclidean_distance(current_center, prev_center)
             if label == prev_label and distance < threshold and distance < closest_distance:
                 
-                # obj["id"] = prev_obj["id"]
-                
-                # Update the historical object
-                # prev_obj["center"] = current_center
+                # Update the object
+                prev_obj["center"] = current_center
                 prev_obj["box"] = obj["box"]
-                prev_obj["frames_remaining"] = 30
+                prev_obj["frames_remaining"] = max_occlusion_frames
                 matched = True
 
-        if not matched:            
+        if not matched:
             # Add a new object to the history
             obj_history.append({
-                "id": detected_objects,
+                "id": num_detected_objects,
                 "center": current_center,
                 "name": label,
                 "box": obj["box"],
-                "frames_remaining": 30,
+                "frames_remaining": max_occlusion_frames,
             })
 
-            detected_objects += 1
+            num_detected_objects += 1
 
-        # current_frame_objects.append(obj)
 
     # Decrement frames_remaining for unmatched historical objects
     for prev_obj in obj_history:
         if prev_obj["frames_remaining"] <= 0:
             obj_history.remove(prev_obj)
 
-def save_roi(image, label, folder, prefix):
-    x1, y1, x2, y2 = (int(label["box"][key]) for key in ["x1", "y1", "x2", "y2"])
-    roi = image[y1:y2, x1:x2]
-    file_name = f"{prefix}_{label['name']}.jpg"
-    cv2.imwrite(os.path.join(folder, file_name), roi)
-
-def log_alert(timestamp, message):
-    with open(LOG_FILE_PATH, "a") as log_file:
-        log_file.write(f"{timestamp}: {message}\n")
-
 def detect_people_without_helmets(people, helmets):
     """
-    Detect people without helmets and save their ROIs.
+    Return a list of people without helmets.
     Args:
-        image: The current frame being processed.
         people: List of detected people objects.
         helmets: List of detected helmet objects.
-        timestamp: Timestamp of the current frame.
     """
     
     people_without_helmets = []
@@ -134,30 +132,58 @@ def detect_people_without_helmets(people, helmets):
                 break
 
         if not using_helmet:
-            # save_roi(image, person, PEOPLE_ROI_FOLDER, timestamp)
-            # log_alert(timestamp, "Person without helmet detected")
             people_without_helmets.append(person)
 
     return people_without_helmets
 
-def process_frame(frame, timestamp):
+def process_frame(
+        model,
+        alerts_history,
+        obj_history,
+        log_file_path,
+        vehicle_roi_folder,
+        people_roi_folder,
+        frame, 
+        max_occlusion_frames,
+        timestamp
+    ):
+
+    
+    """
+    Process a frame and detect vehicles and people without helmets.
+
+    Args:
+        model: YOLO model.
+        alerts_history: Set of IDs of objects that have already triggered an alert.
+        obj_history: List of previous objects.
+        log_file_path: Path to the log file.
+        vehicle_roi_folder: Folder to save vehicle ROIs.
+        people_roi_folder: Folder to save people ROIs.
+        frame: The current frame being processed.
+        max_occlusion_frames: Maximum number of frames an object can be occluded.
+        timestamp: Timestamp of the current frame.
+
+    Returns:
+        The processed frame with bounding boxes.
+    """
     results = model(frame)[0]
     labels = json.loads(results.to_json())
-    log_alert(timestamp, f"Number of objects detected: {len(labels)}")
     
     helmets, people, vehicles = [], [], []
 
-    # Match and update history
-    match_and_update_history(labels)
+    match_and_update_history(
+        current_frame_objects=labels,
+        obj_history=obj_history,
+        max_occlusion_frames=max_occlusion_frames
+    )
 
+    # Extract objects from current frame for analysis
     for label in obj_history:
-        if label["frames_remaining"] != 30:
+        if label["frames_remaining"] != max_occlusion_frames:
             continue
 
         if label["name"] == "vehicle":
             vehicles.append(label)
-            # save_roi(frame, label, VEHICLE_ROI_FOLDER, timestamp)
-            # log_alert(timestamp, "Vehicle detected")
         elif label["name"] == "helmet":
             helmets.append(label)
         elif label["name"] == "person":
@@ -168,25 +194,45 @@ def process_frame(frame, timestamp):
         if label["id"] in alerts_history:
             continue
 
-        save_roi(frame, label, VEHICLE_ROI_FOLDER, timestamp)
-        log_alert(timestamp, "Vehicle detected")
-        alerts_history.append(label["id"])
+        save_roi(frame, label, vehicle_roi_folder, timestamp)
+        log_alert(log_file_path, timestamp, "Vehicle detected")
+        alerts_history.add(label["id"])
 
     people_without_helmets = detect_people_without_helmets(people, helmets)
     
     for label in people_without_helmets:
-        # if label["id"] in alerts_history:
-        #     continue
+        if label["id"] in alerts_history:
+            continue
 
-        save_roi(frame, label, PEOPLE_ROI_FOLDER, timestamp)
-        log_alert(timestamp, "Person without helmet detected")
-        alerts_history.append(label["id"])
-
+        save_roi(frame, label, people_roi_folder, timestamp)
+        log_alert(log_file_path, timestamp, "Person without helmet detected")
+        alerts_history.add(label["id"])
 
     return results.plot()
 
-def main():
-    cap = cv2.VideoCapture(VIDEO_PATH)
+def main(
+        model_path: str,
+        video_path: str,
+        log_file_path: str,
+        vehicle_roi_folder: str,
+        people_roi_folder: str,
+        max_occlusion_frames: int
+    ):
+
+    model = YOLO(model_path)
+
+    global num_detected_objects
+    num_detected_objects = 0
+    alerts_history = set()
+
+    # List of objs wiTh {name, id, center, box, frames_remaining}
+    obj_history = []
+
+    if not os.path.isfile(video_path):
+        print(f"Error: The file '{video_path}' does not exist.")
+        return
+
+    cap = cv2.VideoCapture(video_path)
 
     while cap.isOpened():
         success, frame = cap.read()
@@ -194,16 +240,43 @@ def main():
             break
 
         milliseconds = cap.get(cv2.CAP_PROP_POS_MSEC)
-        timestamp = str(timedelta(milliseconds=milliseconds)) #.replace(":", "-")
+        timestamp = str(timedelta(milliseconds=milliseconds))
 
-        processed_frame = process_frame(frame, timestamp)
+        processed_frame = process_frame(
+            model=model,
+            alerts_history=alerts_history,
+            obj_history=obj_history,
+            log_file_path=log_file_path,
+            vehicle_roi_folder=vehicle_roi_folder,
+            people_roi_folder=people_roi_folder,
+            frame=frame, 
+            max_occlusion_frames=max_occlusion_frames,
+            timestamp=timestamp
+        )
         cv2.imshow('Output', processed_frame)
 
-        if cv2.waitKey(50) & 0xFF == ord('q'):
+        if cv2.waitKey(60) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Process a video and detect vehicles and people without helmets.")
+    parser.add_argument("--model_path", type=str, default="runs/detect/train3/weights/best.pt", help="Path to the YOLO model.")
+    parser.add_argument("--video_path", type=str, default="data/teste.mp4", help="Path to the video file.")
+    parser.add_argument("--log_file_path", type=str, default="alertas.log", help="Path to the log file.")
+    parser.add_argument("--vehicle_roi_folder", type=str, default="ROI/vehicle", help="Folder to save vehicle ROIs.")
+    parser.add_argument("--people_roi_folder", type=str, default="ROI/people", help="Folder to save people ROIs.")
+    parser.add_argument("--max_occlusion_frames", type=int, default=15, help="Maximum occlusion frames before object is removed.")
+
+    args = parser.parse_args()
+
+    main(
+        model_path=args.model_path,
+        video_path=args.video_path,
+        log_file_path=args.log_file_path,
+        vehicle_roi_folder=args.vehicle_roi_folder,
+        people_roi_folder=args.people_roi_folder,
+        max_occlusion_frames=args.max_occlusion_frames
+    )
