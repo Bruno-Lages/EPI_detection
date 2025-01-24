@@ -27,7 +27,7 @@ pip install -r requirements.txt
 ```
 
 ## Como rodar o código
-Basta chamar o arquivo `inference.py` com os parâmetros especificado abaixo
+Basta chamar o arquivo `inference.py`, sendo possível especificar os seguintes parâmetros abaixo caso preciso:
 
 `model_path`: Caminho para o modelo treinado YOLO (arquivo .pt) que será usado para detecção de objetos.
 Valor Padrão: "runs/detect/train3/weights/best.pt"
