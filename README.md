@@ -23,7 +23,7 @@ No entanto, existe um limite de tempo configurável para o máximo de quadros qu
 Após clonar o repositório, basta baixar os pacotes no `requirements.txt`.
 
 ```
-pip isntall -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Como rodar o código
